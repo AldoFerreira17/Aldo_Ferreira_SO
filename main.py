@@ -2,461 +2,387 @@ import math
 import hashlib
 
 class DiskBlock:
-    def __init__(self, index):
+    def __init__(self, index, size=4096):
         self.index = index
-        self.status = "LIVRE"  # LIVRE, INODE, DADO
-        self.owner_path = None
+        self.status = "LIVRE"
+        self.owner = None
         self.used_bytes = 0
-        self.data_content = ""
-        self.hash_integrity = None  # Usado para checar corrupção (Anti-Vírus)
+        self.data = bytearray(size)
+        self.pointers = []       # Tabela de ponteiros do i-node
+        self.saved_hash = None   # Hash oficial registrado para o Antivírus
+        self.track = (index * 19 + 11) % 200
+
+    def write(self, raw_bytes):
+        n = min(len(raw_bytes), len(self.data))
+        self.data[:n] = raw_bytes[:n]
+        self.used_bytes = n
+        self.saved_hash = self.calc_hash()
+
+    def read(self):
+        return bytes(self.data[:self.used_bytes])
+
+    def calc_hash(self):
+        return hashlib.sha256(self.read()).hexdigest()
+
 
 class FileNode:
-    def __init__(self, name, is_dir=False, parent=None):
+    def __init__(self, name, is_dir=False, parent=None, owner="root", group="admin", perms="755"):
         self.name = name
         self.is_dir = is_dir
         self.parent = parent
         self.children = {}
         self.size = 0
         self.inode_block = None
-        self.data_blocks = []
-        
-        # Etapa 3: Segurança e ACL
-        self.owner = "root"
-        self.group = "admin"
-        self.perms = "755"  # Padrão
-        self.is_encrypted = False
+        self.owner = owner
+        self.group = group
+        self.perms = perms
+        self.encrypted = False
+
 
 class FileSystem:
     def __init__(self, block_size=4096, total_blocks=16):
         self.block_size = block_size
         self.total_blocks = total_blocks
-        self.disk = [DiskBlock(i) for i in range(total_blocks)]
+        self.disk = [DiskBlock(i, block_size) for i in range(total_blocks)]
         
+        # 3 Discos físicos reais para o RAID 5
+        self.raid_disks = [bytearray(block_size) for _ in range(3)]
+        self.io_queue = []
+        self.head_pos = 53
+
+        # Inicializa Raiz '/' no Bloco 0
         self.root = FileNode("/", is_dir=True)
-        self.root.inode_block = 0
+        self.root.parent = self.root
+        self.cwd = self.root
         self.disk[0].status = "INODE_RAIZ"
-        self.disk[0].owner_path = "Diretório '/'"
-        self.disk[0].used_bytes = self.block_size
+        self.disk[0].owner = "Diretório '/'"
+        self.disk[0].write(b"ROOT_DIR")
 
-        # Etapa 3: Gerenciamento de Usuários
+        # Usuários e Autenticação (Etapa 3)
         self.users = {
-            "root": {"hash": self._hash_password("admin123"), "group": "admin"},
-            "carlos": {"hash": self._hash_password("senha123"), "group": "devs"}
+            "root": {"hash": self._hash_pw("admin123"), "group": "admin"},
+            "carlos": {"hash": self._hash_pw("senha123"), "group": "devs"}
         }
-        self.current_user = "root"
-        self.current_group = "admin"
-        self.mode = "MODO_KERNEL"  # ou MODO_USUARIO
+        self.user = "root"
+        self.group = "admin"
+        self.mode = "MODO_KERNEL"
 
-    # ==========================================
-    # RESOLUÇÃO DE CAMINHOS
-    # ==========================================
-    def _resolve_path(self, path):
+    # --- NAVEGAÇÃO (Caminhos Absolutos e Relativos) ---
+    def _resolve(self, path):
         if path == "/":
-            return self.root, ""
+            return self.root, "", self.root
+        curr = self.root if path.startswith("/") else self.cwd
         parts = [p for p in path.split("/") if p]
-        curr = self.root
-        for part in parts[:-1]:
-            if part in curr.children and curr.children[part].is_dir:
-                curr = curr.children[part]
+        for p in parts[:-1]:
+            if p == "..":
+                curr = curr.parent
+            elif p != "." and p in curr.children and curr.children[p].is_dir:
+                curr = curr.children[p]
             else:
-                return None, None
-        return curr, parts[-1] if parts else ""
+                return None, None, None
+        last = parts[-1] if parts else ""
+        if last == "..":
+            return curr.parent.parent, curr.parent.name, curr.parent
+        return curr, last, curr.children.get(last)
 
-    def _get_node(self, path):
-        if path == "/":
-            return self.root
-        parent, name = self._resolve_path(path)
-        if parent and name in parent.children:
-            return parent.children[name]
-        return None
+    def _abs_path(self, node):
+        if node == self.root:
+            return "/"
+        parts = []
+        while node != self.root:
+            parts.append(node.name)
+            node = node.parent
+        return "/" + "/".join(reversed(parts))
 
-    # ==========================================
-    # ETAPA 3: SEGURANÇA E AUTENTICAÇÃO
-    # ==========================================
-    def _hash_password(self, password):
-        salt = "SISTEMA_SO_2026"
-        return hashlib.sha256((password + salt).encode()).hexdigest()
+    # --- ETAPA 3: SEGURANÇA, ACL, CRIPTOGRAFIA E ANTIVÍRUS ---
+    def _hash_pw(self, pw):
+        return hashlib.sha256((pw + "SALT_SO").encode()).hexdigest()
 
     def login(self, username, password):
-        print(f"> login --user {username}")
-        print("Senha: " + "*" * len(password))
-        if username in self.users and self.users[username]["hash"] == self._hash_password(password):
-            self.current_user = username
-            self.current_group = self.users[username]["group"]
+        print(f"> login --user {username}\nSenha: {'*' * len(password)}")
+        if username in self.users and self.users[username]["hash"] == self._hash_pw(password):
+            self.user = username
+            self.group = self.users[username]["group"]
             self.mode = "MODO_KERNEL" if username == "root" else "MODO_USUARIO"
-            print(f"Autenticado com sucesso. Usuário: '{self.current_user}' | Grupo: '{self.current_group}' | Modo: {self.mode}\n")
-        else:
-            print("[ERRO] Falha na autenticação.\n")
+            print(f"Autenticado com sucesso. Usuário: '{self.user}' | Grupo: '{self.group}' | Modo: {self.mode}\n")
 
-    def _rwx_string(self, octal_perms):
-        mapping = {'7': 'rwx', '6': 'rw-', '5': 'r-x', '4': 'r--', '3': '-wx', '2': '-w-', '1': '--x', '0': '---'}
-        return "".join([mapping.get(c, '---') for c in str(octal_perms)])
-
-    def _check_access(self, node, path, required_mode='r', verbose=False):
-        action_name = "LEITURA" if required_mode == 'r' else "ESCRITA" if required_mode == 'w' else "EXECUÇÃO"
-        
+    def _check_acl(self, node, path, req_perm, verbose=False):
         if self.mode == "MODO_KERNEL":
             return True
+        idx = 0 if self.user == node.owner else (1 if self.group == node.group else 2)
+        val = int(node.perms[idx])
+        allowed = (req_perm == 'r' and val >= 4) or (req_perm == 'w' and (val & 2)) or (req_perm == 'x' and (val & 1))
 
-        owner_p, group_p, others_p = str(node.perms)[0], str(node.perms)[1], str(node.perms)[2]
-        
-        if self.current_user == node.owner:
-            active_perm = owner_p
-        elif self.current_group == node.group:
-            active_perm = group_p
-        else:
-            active_perm = others_p
+        if verbose or not allowed:
+            rwx = "".join({'7':'rwx','6':'rw-','5':'r-x','4':'r--','3':'-wx','2':'-w-','1':'--x','0':'---'}[c] for c in node.perms)
+            act = {'r': 'LEITURA', 'w': 'ESCRITA', 'x': 'EXECUÇÃO'}[req_perm]
+            print(f"[SISTEMA DE SEGURANÇA - VERIFICAÇÃO DE ACL]\nObjeto      : {path}")
+            print(f"Proprietário: {node.owner} (Grupo: {node.group})\nPermissões  : {rwx} ({node.perms})")
+            print(f"Ação Pedida : {act} por '{self.user}' (Grupo: {self.group})\n")
+            if not allowed:
+                print(f"[NEGADO]: O usuário '{self.user}' não possui permissão de {act.lower()} no objeto '{path}'.")
+                print("Tentativa não autorizada registrada nos logs do sistema.\n")
+        return allowed
 
-        has_access = False
-        val = int(active_perm)
-        if required_mode == 'r' and val >= 4:
-            has_access = True
-        elif required_mode == 'w' and val in [2, 3, 6, 7]:
-            has_access = True
-        elif required_mode == 'x' and val in [1, 3, 5, 7]:
-            has_access = True
-
-        if verbose or not has_access:
-            print("[SISTEMA DE SEGURANÇA - VERIFICAÇÃO DE ACL]")
-            print(f"Objeto      : {path}")
-            print(f"Proprietário: {node.owner} (Grupo: {node.group})")
-            print(f"Permissões  : {self._rwx_string(node.perms)} ({node.perms})")
-            print(f"Ação Pedida : {action_name} por '{self.current_user}' (Grupo: {self.current_group})\n")
-
-        if not has_access:
-            print(f"[NEGADO]: O usuário '{self.current_user}' não possui permissão de {action_name.lower()} no objeto '{path}'.")
-            print("Tentativa não autorizada registrada nos logs do sistema.\n")
-            return False
-        return True
-
-    def chown(self, path, owner, group):
-        node = self._get_node(path)
+    def set_acl(self, path, owner, group, perms):
+        _, _, node = self._resolve(path)
         if node and self.mode == "MODO_KERNEL":
-            node.owner = owner
-            node.group = group
-
-    def chmod(self, path, perms):
-        node = self._get_node(path)
-        if node and (self.mode == "MODO_KERNEL" or self.current_user == node.owner):
-            node.perms = perms
+            node.owner, node.group, node.perms = owner, group, perms
 
     def encrypt_file(self, path, key):
         print(f'> encrypt_file {path} --key "{key}"')
-        node = self._get_node(path)
-        if node and not node.is_dir and self._check_access(node, path, 'w'):
-            node.is_encrypted = True
-            for b_idx in node.data_blocks:
-                self.disk[b_idx].data_content = "0x8F4A12B... (Encrypted Ciphertext)"
-                self.disk[b_idx].hash_integrity = hashlib.sha256(self.disk[b_idx].data_content.encode()).hexdigest()
-            print(f"Arquivo '{path}' criptografado com sucesso.")
-            print('Conteúdo gravado nos blocos físicos: "0x8F4A12B... (Encrypted Ciphertext)"\n')
-
-    def antivirus_scan(self, root_path="/"):
-        print(f"> antivirus_scan {root_path}")
-        print("[MÓDULO DE SEGURANÇA - VARREDURA DE INTEGRIDADE]")
-        print("Analisando arquivos em busca de assinaturas maliciosas e hashes corrompidos...")
+        _, _, node = self._resolve(path)
+        if not node or not self._check_acl(node, path, 'w'):
+            return
+        key_bytes = hashlib.sha256(key.encode()).digest()
         
-        def scan_node(node, path_str):
-            if node.is_dir:
-                for child in node.children.values():
-                    child_path = f"{path_str}/{child.name}".replace("//", "/")
-                    scan_node(child, child_path)
-            else:
-                corrupted = False
-                for b_idx in node.data_blocks:
-                    block = self.disk[b_idx]
-                    current_hash = hashlib.sha256(str(block.data_content).encode()).hexdigest()
-                    if block.hash_integrity and block.hash_integrity != current_hash:
-                        corrupted = True
-                        break
-                
-                if corrupted:
-                    print(f"\n- {path_str:<26}: [ALERTA] Hash do bloco difere do registro oficial!\n")
-                    print("  Resultado: Possível modificação direta não autorizada no bloco do disco.")
-                else:
-                    status = "[OK - Criptografado e Íntegro]" if node.is_encrypted else "[OK - Íntegro]"
-                    print(f"- {path_str:<26}: {status}")
+        # Criptografa de verdade os bytes de cada bloco físico do arquivo via XOR
+        for b_idx in self.disk[node.inode_block].pointers:
+            raw = self.disk[b_idx].read()
+            cipher = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(raw))
+            self.disk[b_idx].write(cipher)
+            
+        node.encrypted = True
+        sample = "0x" + self.disk[self.disk[node.inode_block].pointers[0]].read()[:4].hex().upper()
+        print(f"Arquivo '{path}' criptografado com sucesso.")
+        print(f'Conteúdo gravado nos blocos físicos: "{sample}... (Encrypted Ciphertext)"\n')
 
-        scan_node(self.root, "")
+    def antivirus_scan(self):
+        print("> antivirus_scan /\n[MÓDULO DE SEGURANÇA - VARREDURA DE INTEGRIDADE]")
+        files = []
+        def get_files(n):
+            for c in n.children.values():
+                get_files(c) if c.is_dir else files.append(c)
+        get_files(self.root)
+        print(f"Analisando {len(files)} arquivos em busca de assinaturas maliciosas e hashes corrompidos...")
+
+        for f in files:
+            p = self._abs_path(f)
+            # Recalcula o hash SHA-256 real dos bytes de cada bloco e compara com o oficial
+            corrupted = any(self.disk[b].calc_hash() != self.disk[b].saved_hash for b in self.disk[f.inode_block].pointers)
+            if corrupted:
+                print(f"\n- {p:<26}: [ALERTA] Hash do bloco difere do registro oficial!")
+                print("  Resultado: Possível modificação direta não autorizada no bloco do disco.")
+            else:
+                tag = "[OK - Criptografado e Íntegro]" if f.encrypted else "[OK - Íntegro]"
+                print(f"- {p:<26}: {tag}")
         print()
 
-    def simulate_block_corruption(self, path):
-        node = self._get_node(path)
-        if node and not node.is_dir and node.data_blocks:
-            self.disk[node.data_blocks[0]].data_content = "VIRUS_INJECTED_CODE"
-
-    # ==========================================
-    # ETAPA 1: CRUD E MAPEAMENTO
-    # ==========================================
+    # --- ETAPA 1: CRUD E ALOCAÇÃO INDEXADA (i-node) ---
     def mkdir(self, path, silent=False):
         if not silent:
             print(f"> mkdir {path}")
-        parent, name = self._resolve_path(path)
-        parent_path = path.rsplit("/", 1)[0] or "/"
-        if not parent or name in parent.children:
-            print(f"Erro: Caminho inválido ou diretório já existe ({path})")
-            return
-        if not self._check_access(parent, parent_path, 'w'):
-            return
-        
-        new_dir = FileNode(name, is_dir=True, parent=parent)
-        new_dir.owner = self.current_user
-        new_dir.group = self.current_group
-        parent.children[name] = new_dir
+        parent, name, exist = self._resolve(path)
+        if parent and not exist and self._check_acl(parent, self._abs_path(parent), 'w'):
+            parent.children[name] = FileNode(name, is_dir=True, parent=parent, owner=self.user, group=self.group)
 
     def create(self, path, size_kb, silent=False):
         if not silent:
             print(f"> create {path} --size {size_kb}")
-        parent, name = self._resolve_path(path)
-        parent_path = path.rsplit("/", 1)[0] or "/"
-        if not parent or name in parent.children:
-            print(f"Erro: Caminho inválido ou arquivo já existe ({path})")
-            return
-        if not self._check_access(parent, parent_path, 'w'):
+        parent, name, exist = self._resolve(path)
+        if not parent or exist or not self._check_acl(parent, self._abs_path(parent), 'w'):
             return
 
-        size_bytes = int(size_kb.replace("KB", "").strip()) * 1024
+        size_bytes = int(size_kb.upper().replace("KB", "")) * 1024
         blocks_needed = math.ceil(size_bytes / self.block_size)
-        
-        free_blocks = [b.index for b in self.disk if b.status == "LIVRE"]
-        if len(free_blocks) < blocks_needed + 1:
-            print("Erro: Espaço insuficiente no disco.")
-            return
+        free = [b.index for b in self.disk if b.status == "LIVRE"]
+        if len(free) < blocks_needed + 1:
+            return print("Erro: Disco cheio.")
 
-        new_file = FileNode(name, is_dir=False, parent=parent)
-        new_file.size = size_bytes
-        new_file.owner = self.current_user
-        new_file.group = self.current_group
-        
-        inode_idx = free_blocks.pop(0)
+        fnode = FileNode(name, is_dir=False, parent=parent, owner=self.user, group=self.group)
+        fnode.size = size_bytes
+        abs_p = (self._abs_path(parent) + "/" + name).replace("//", "/")
+
+        # Aloca bloco de i-node e grava a tabela de ponteiros real
+        inode_idx = free.pop(0)
+        data_idxs = free[:blocks_needed]
         self.disk[inode_idx].status = f"INODE_{name.split('.')[0].upper()}"
-        self.disk[inode_idx].owner_path = f"Arquivo '{path}'"
-        new_file.inode_block = inode_idx
+        self.disk[inode_idx].owner = f"Arquivo '{abs_p}'"
+        self.disk[inode_idx].pointers = data_idxs
+        self.disk[inode_idx].write(str(data_idxs).encode())
+        fnode.inode_block = inode_idx
 
-        remaining_bytes = size_bytes
-        for _ in range(blocks_needed):
-            b_idx = free_blocks.pop(0)
+        # Grava os bytes reais nos blocos de dados apontados pelo i-node
+        payload = (f"DADOS_DO_ARQUIVO_{name}_".encode() * 512)[:size_bytes]
+        rem = size_bytes
+        for i, b_idx in enumerate(data_idxs):
+            chunk = payload[i * self.block_size : i * self.block_size + min(rem, self.block_size)]
             self.disk[b_idx].status = "DADO"
-            self.disk[b_idx].owner_path = path
-            
-            allocated = min(remaining_bytes, self.block_size)
-            self.disk[b_idx].used_bytes = allocated
-            self.disk[b_idx].data_content = "DATA"
-            self.disk[b_idx].hash_integrity = hashlib.sha256("DATA".encode()).hexdigest()
-            new_file.data_blocks.append(b_idx)
-            remaining_bytes -= allocated
+            self.disk[b_idx].owner = abs_p
+            self.disk[b_idx].write(chunk)
+            self.io_queue.append(self.disk[b_idx].track)
+            rem -= len(chunk)
 
-        parent.children[name] = new_file
+        parent.children[name] = fnode
 
     def read_file(self, path):
         print(f"> read_file {path}")
-        node = self._get_node(path)
-        if node and not node.is_dir:
-            if self._check_access(node, path, 'r', verbose=True):
-                print(f"Conteúdo de '{path}' lido com sucesso.\n")
-        else:
-            print("Erro: Arquivo não encontrado.\n")
+        _, _, node = self._resolve(path)
+        if node and not node.is_dir and self._check_acl(node, path, 'r', verbose=True):
+            data = b"".join(self.disk[b].read() for b in self.disk[node.inode_block].pointers)
+            print(f"Leitura concluída: {len(data)} bytes lidos dos blocos {self.disk[node.inode_block].pointers}.\n")
 
     def rm(self, path):
         print(f"> rm {path}")
-        parent, name = self._resolve_path(path)
-        if not parent or name not in parent.children:
-            print("Erro: Arquivo não encontrado.")
-            return
-        
-        node = parent.children[name]
-        if not self._check_access(node, path, 'w'):
-            return
-        
-        if not node.is_dir:
-            self.disk[node.inode_block].status = "LIVRE"
-            for b_idx in node.data_blocks:
-                self.disk[b_idx].status = "LIVRE"
-        
-        del parent.children[name]
-        print(f"[{path} removido e blocos liberados]\n")
+        parent, name, node = self._resolve(path)
+        if node and not node.is_dir and self._check_acl(node, path, 'w'):
+            for b in self.disk[node.inode_block].pointers + [node.inode_block]:
+                self.disk[b] = DiskBlock(b, self.block_size)
+            del parent.children[name]
 
     def print_tree(self, node=None, prefix=""):
-        if node is None: 
-            print("\n[ÁRVORE DO SISTEMA DE ARQUIVOS]")
+        if node is None:
+            print("\n[ÁRVORE DO SISTEMA DE ARQUIVOS]\n/")
             node = self.root
-            print("/")
-        
-        children = list(node.children.values())
-        for i, child in enumerate(children):
-            is_last = (i == len(children) - 1)
-            connector = "└── " if is_last else "├── "
-            
+        items = list(node.children.values())
+        for i, child in enumerate(items):
+            last = (i == len(items) - 1)
+            conn = "└── " if last else "├── "
             if child.is_dir:
-                print(f"{prefix}{connector}{child.name}/ [DIR]")
-                self.print_tree(child, prefix + ("    " if is_last else "│   "))
+                print(f"{prefix}{conn}{child.name}/ [DIR]")
+                self.print_tree(child, prefix + ("    " if last else "│   "))
             else:
-                size_kb = child.size // 1024
-                print(f"{prefix}{connector}{child.name} ({size_kb} KB) [ARQ]")
+                print(f"{prefix}{conn}{child.name} ({child.size // 1024} KB) [ARQ]")
         if node == self.root:
             print()
 
     def fs_status(self):
         print("> fs_status --details")
-        print(f"Tamanho do Bloco de Disco: {self.block_size // 1024} KB | Total de Blocos: {self.total_blocks} ({self.total_blocks * self.block_size // 1024} KB)\n")
+        print(f"Tamanho do Bloco de Disco: {self.block_size//1024} KB | Total de Blocos: {self.total_blocks} ({self.total_blocks*self.block_size//1024} KB)\n")
         print("[MAPA DE ALOCAÇÃO DO DISCO (Indexado)]")
         
-        internal_frag = 0
-        file_stats = {}
-
+        counts, frag_info = {}, {}
         for b in self.disk:
-            if b.status == "LIVRE":
-                pass 
-            elif "INODE" in b.status:
-                print(f"Bloco {b.index:02d} [{b.status}]   : {b.owner_path}")
-            else:
-                if b.owner_path not in file_stats:
-                    file_stats[b.owner_path] = {'blocks': 0, 'size': 0, 'last_block': b.index}
-                file_stats[b.owner_path]['blocks'] += 1
-                file_stats[b.owner_path]['last_block'] = b.index
-                b_num = file_stats[b.owner_path]['blocks']
-                
-                print(f"Bloco {b.index:02d} [DADO]        : '{b.owner_path}' (Bloco {b_num} - {b.used_bytes} bytes ocupados)")
-                
-                if b.used_bytes < self.block_size:
-                    frag = self.block_size - b.used_bytes
-                    internal_frag += frag
-                    file_stats[b.owner_path]['frag'] = frag
+            if b.status.startswith("INODE"):
+                print(f"Bloco {b.index:02d} [{b.status:<10}] : {b.owner}")
+            elif b.status == "DADO":
+                counts[b.owner] = counts.get(b.owner, 0) + 1
+                print(f"Bloco {b.index:02d} [DADO]        : '{b.owner}' (Bloco {counts[b.owner]} - {b.used_bytes} bytes ocupados)")
+                frag_info[b.owner] = (self.block_size - b.used_bytes, b.index)
 
-        free_blocks = [b.index for b in self.disk if b.status == "LIVRE"]
-        if free_blocks:
-            if len(free_blocks) > 1:
-                print(f"Bloco {free_blocks[0]:02d}..{free_blocks[-1]:02d}           : [LIVRE]")
-            else:
-                print(f"Bloco {free_blocks[0]:02d}               : [LIVRE]")
+        free = [b.index for b in self.disk if b.status == "LIVRE"]
+        if free:
+            print(f"Bloco {free[0]:02d}..{free[-1]:02d}           : [LIVRE]")
 
         print("\n--- RELATÓRIO DE FRAGMENTAÇÃO ---")
-        for path, stats in file_stats.items():
-            file_node = self._get_node(path)
-            name = file_node.name
-            real_size = file_node.size
-            allocated = len(file_node.data_blocks) * self.block_size
-            frag = stats.get('frag', 0)
-            last_b = stats.get('last_block', 0)
-            perc = (frag / self.block_size) * 100 if frag > 0 else 0
-            
-            print(f"Tamanho Real do Arquivo '{name}': {real_size} bytes ({real_size // 1024} KB)")
-            print(f"Espaço Alocado no Disco          : {allocated} bytes ({len(file_node.data_blocks)} blocos de {self.block_size // 1024} KB)")
-            print(f"Fragmentação Interna             : {frag} bytes ({perc:.0f}% de desperdício no Bloco {last_b:02d})")
-            
-        print("Fragmentação Externa             : 0 bytes")
-        print("Necessidade de Compactação       : NÃO (Blocos alocados via i-node indexado)\n")
+        for path, (frag, last_b) in frag_info.items():
+            _, _, f = self._resolve(path)
+            n_blocks = len(self.disk[f.inode_block].pointers)
+            alloc = n_blocks * self.block_size
+            print(f"Tamanho Real do Arquivo '{f.name}': {f.size} bytes ({f.size//1024} KB)")
+            print(f"Espaço Alocado no Disco          : {alloc} bytes ({n_blocks} blocos de {self.block_size//1024} KB)")
+            print(f"Fragmentação Interna             : {frag} bytes ({(frag/self.block_size)*100:.0f}% de desperdício no Bloco {last_b:02d})")
+        print("Fragmentação Externa             : 0 bytes\nNecessidade de Compactação       : NÃO (Blocos alocados via i-node indexado)\n")
 
-    # ==========================================
-    # ETAPA 2: I/O, ESCALONAMENTO E RAID
-    # ==========================================
-    def write_file(self, path, content, simulate_sstf_tracks=None, simulate_raid=False):
-        node = self._get_node(path)
-        if node and not simulate_raid:
-            if not self._check_access(node, path, 'w'):
-                return
-            
-        if simulate_raid:
-            print(f"> write_file {path} --size {content}")
-        else:
-            print(f'> write_file {path} "{content}"')
-            
-        if simulate_sstf_tracks:
-            self._simulate_sstf(initial_pos=53, requests=simulate_sstf_tracks)
-            
-        if simulate_raid:
-            self._simulate_raid5(path, content)
+    # --- ETAPA 2: ESCALONAMENTO SSTF E RAID 5 REAL ---
+    def write_file(self, path, text, custom_tracks=None):
+        print(f'> write_file {path} "{text}"')
+        _, _, node = self._resolve(path)
+        if node and self._check_acl(node, path, 'w'):
+            last_b = self.disk[node.inode_block].pointers[-1]
+            self.disk[last_b].write(self.disk[last_b].read() + text.encode())
+            self.io_queue.append(self.disk[last_b].track)
 
-    def _simulate_sstf(self, initial_pos, requests):
-        print(f"[E/S] Requisições de leitura/escrita pendentes nas trilhas: {requests}")
-        print(f"Posição atual da cabeça de leitura: Trilha {initial_pos}\n")
+        reqs = custom_tracks if custom_tracks else self.io_queue
+        print(f"[E/S] Requisições de leitura/escrita pendentes nas trilhas: {reqs}")
+        print(f"Posição atual da cabeça de leitura: Trilha {self.head_pos}\n")
         print("--- ESCALONAMENTO DE DISCO: SSTF (Shortest Seek Time First) ---")
-        
-        current = initial_pos
-        unvisited = requests.copy()
-        order = [current]
-        movements = []
-        distances = []
-        total_movement = 0
-        
-        while unvisited:
-            closest = min(unvisited, key=lambda x: abs(x - current))
-            dist = abs(closest - current)
-            movements.append(f"|{current}-{closest}|")
-            distances.append(str(dist))
-            total_movement += dist
-            current = closest
-            unvisited.remove(closest)
-            order.append(current)
-            
-        print(f"Ordem de Atendimento : {' -> '.join(map(str, order))}")
-        print(f"Deslocamento da Cabeça: {' + '.join(movements)}")
-        print(f"Total de Movimento    : {' + '.join(distances)} = {total_movement} trilhas\n")
 
-    def _simulate_raid5(self, path, size):
+        curr, unvisited = self.head_pos, reqs.copy()
+        order, movs, dists, total = [curr], [], [], 0
+        while unvisited:
+            nxt = min(unvisited, key=lambda x: abs(x - curr))
+            d = abs(nxt - curr)
+            movs.append(f"|{curr}-{nxt}|")
+            dists.append(str(d))
+            total += d
+            curr = nxt
+            unvisited.remove(nxt)
+            order.append(curr)
+
+        self.head_pos = curr
+        self.io_queue.clear()
+        print(f"Ordem de Atendimento : {' -> '.join(map(str, order))}")
+        print(f"Deslocamento da Cabeça: {' + '.join(movs)}")
+        print(f"Total de Movimento    : {' + '.join(dists)} = {total} trilhas\n")
+
+    def write_raid5(self, path, size_kb):
+        print(f"> write_file {path} --size {size_kb}")
         print("Arranjo Ativo: RAID 5 (3 Discos Físicos, Blocos de 4 KB)\n")
-        print("[E/S - DISTRIBUIÇÃO EM DISCO]")
+        
+        # Cria dois blocos reais de 4 KB e calcula a paridade matemática via XOR byte a byte
+        part1 = (b"PLANILHA_PARTE_1_" * 256)[:self.block_size]
+        part2 = (b"PLANILHA_PARTE_2_" * 256)[:self.block_size]
+        parity = bytes(b1 ^ b2 for b1, b2 in zip(part1, part2))
+
+        self.raid_disks[0][:] = part1
+        self.raid_disks[1][:] = part2
+        self.raid_disks[2][:] = parity
+
         name = path.split("/")[-1].split(".")[0].capitalize()
+        print("[E/S - DISTRIBUIÇÃO EM DISCO]")
         print(f"Disco 1: [Bloco 01: Dados da {name} - Part 1 (4 KB)]")
         print(f"Disco 2: [Bloco 02: Dados da {name} - Part 2 (4 KB)]")
         print("Disco 3: [PARIDADE : XOR(Bloco 01, Bloco 02)]\n")
+
         print("[TESTE DE FALHA SIMULADO]")
         print("- Falha forçada no Disco 2!\n")
-        print("- Recuperando Bloco 02 via operação XOR: (Disco 1 XOR Disco 3) -> Reconstrução [OK]\n")
+        # Zera fisicamente os bytes do Disco 2 para simular a perda real
+        self.raid_disks[1] = bytearray(self.block_size)
+
+        # Reconstrói os bytes do Disco 2 fazendo (Disco 1 XOR Disco 3) byte a byte
+        recovered = bytes(b1 ^ bp for b1, bp in zip(self.raid_disks[0], self.raid_disks[2]))
+        self.raid_disks[1][:] = recovered
+        status = "OK" if recovered == part2 else "ERRO"
+        print(f"- Recuperando Bloco 02 via operação XOR: (Disco 1 XOR Disco 3) -> Reconstrução [{status}]\n")
 
 
 if __name__ == "__main__":
     fs = FileSystem(block_size=4096, total_blocks=16)
-    
-    print("==================================================")
-    print(" ETAPA 1: HIERARQUIA E ALOCAÇÃO DE BLOCOS")
-    print("==================================================\n")
-    
-    # Exemplo 1.1: Criação e Exibição da Árvore Hierárquica
+
+    # --- ETAPA 1 ---
     fs.mkdir("/sistema")
     fs.mkdir("/sistema/logs")
     fs.create("/sistema/logs/app.log", "10KB")
     fs.print_tree()
-    
-    # Exemplo 1.2: Alocação Indexada e Análise de Fragmentação
     fs.fs_status()
 
-    print("==================================================")
-    print(" ETAPA 2: ESCALONAMENTO DE DISCO E RAID")
-    print("==================================================\n")
-
-    # Exemplo 2.1: Escalonamento do Braço do Disco (SSTF)
-    fs.write_file("/sistema/logs/app.log", "Novo Registro", simulate_sstf_tracks=[98, 183, 37, 122, 14])
-
-    # Exemplo 2.2: Gravação Física sob Arranjo RAID 5
+    # --- ETAPA 2 ---
+    fs.write_file("/sistema/logs/app.log", "Novo Registro", custom_tracks=[98, 183, 37, 122, 14])
     fs.mkdir("/dados", silent=True)
-    fs.write_file("/dados/planilha.csv", "8KB", simulate_raid=True)
+    fs.write_raid5("/dados/planilha.csv", "8KB")
 
-    print("==================================================")
-    print(" ETAPA 3: SEGURANÇA, ACL, CRIPTOGRAFIA E ANTIVÍRUS")
-    print("==================================================\n")
-
-    # Preparando ambiente para os testes da Etapa 3 (em modo Root silencioso)
+    # --- ETAPA 3 ---
     fs.create("/sistema/config.sys", "4KB", silent=True)
-    fs.chown("/sistema/config.sys", "root", "admin")
-    fs.chmod("/sistema/config.sys", "750")
+    fs.set_acl("/sistema/config.sys", "root", "admin", "750")
 
     fs.mkdir("/home", silent=True)
     fs.mkdir("/home/carlos", silent=True)
-    fs.chown("/home/carlos", "carlos", "devs")
+    fs.set_acl("/home/carlos", "carlos", "devs", "755")
     fs.create("/home/carlos/segredo.txt", "2KB", silent=True)
-    fs.chown("/home/carlos/segredo.txt", "carlos", "devs")
-    fs.chmod("/home/carlos/segredo.txt", "700")
+    fs.set_acl("/home/carlos/segredo.txt", "carlos", "devs", "700")
 
-    # Exemplo 3.1: Autenticação e Verificação de Matriz/ACL
+    # Login como Carlos e teste de bloqueio de ACL
     fs.login("carlos", "senha123")
     fs.read_file("/sistema/config.sys")
 
-    # Exemplo 3.2: Criptografia de Conteúdo e Anti-Vírus Simulado
+    # Criptografia XOR real nos blocos de segredo.txt
     fs.encrypt_file("/home/carlos/segredo.txt", "MinhaChave123")
-    
-    # Simulando adulteração direta no bloco físico do app.log para o antivírus detectar
-    fs.simulate_block_corruption("/sistema/logs/app.log")
-    
-    # Executando varredura de integridade
-    fs.antivirus_scan("/")
+
+    # Adulteração direta na memória física do primeiro bloco de app.log para o Antivírus detectar
+    bloco_alvo = fs.disk[fs.root.children["sistema"].children["logs"].children["app.log"].inode_block].pointers[0]
+    fs.disk[bloco_alvo].data[:15] = b"DADO_CORROMPIDO"
+
+    fs.antivirus_scan()
+    print("=== TERMINAL INTERATIVO (Digite comandos ou 'sair' para encerrar) ===")
+    while True:
+        cmd = input(f"{fs.user}@so-ufrpe$ ").strip().split()
+        if not cmd or cmd[0] == "sair": break
+        elif cmd[0] == "mkdir" and len(cmd) > 1: fs.mkdir(cmd[1])
+        elif cmd[0] == "create" and len(cmd) > 2: fs.create(cmd[1], cmd[2])
+        elif cmd[0] == "read_file" and len(cmd) > 1: fs.read_file(cmd[1])
+        elif cmd[0] == "rm" and len(cmd) > 1: fs.rm(cmd[1])
+        elif cmd[0] == "tree": fs.print_tree()
+        elif cmd[0] == "fs_status": fs.fs_status()
+        elif cmd[0] == "antivirus_scan": fs.antivirus_scan()
+        else: print("Comandos: mkdir <path>, create <path> <N>KB, read_file <path>, rm <path>, tree, fs_status, antivirus_scan, sair")
