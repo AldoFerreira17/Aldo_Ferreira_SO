@@ -39,6 +39,244 @@ class FileNode:
         self.encrypted = False
 
 
+class ReservedMemory:
+    """Região Estática/Fixa da RAM (4 MB) com alocação contígua (First-Fit) e compactação."""
+    def __init__(self, total_kb=4096):
+        self.total_kb = total_kb
+        # Lista de blocos alocados: [start_kb, size_kb, name]
+        self.segments = [[0, 1024, "Núcleo Base do SO"]]
+
+    def allocate(self, name, size_kb):
+        # Ordena segmentos por endereço inicial
+        self.segments.sort(key=lambda s: s[0])
+        cursor = 0
+        for start, size, _ in self.segments:
+            if start - cursor >= size_kb:
+                self.segments.append([cursor, size_kb, name])
+                self.segments.sort(key=lambda s: s[0])
+                return cursor, cursor + size_kb
+            cursor = start + size
+        if self.total_kb - cursor >= size_kb:
+            self.segments.append([cursor, size_kb, name])
+            self.segments.sort(key=lambda s: s[0])
+            return cursor, cursor + size_kb
+        return None
+
+    def free(self, name):
+        for i, (start, size, proc_name) in enumerate(self.segments):
+            if proc_name == name:
+                self.segments.pop(i)
+                return start, start + size, size
+        return None
+
+    def get_free_holes(self):
+        self.segments.sort(key=lambda s: s[0])
+        holes = []
+        cursor = 0
+        for start, size, _ in self.segments:
+            if start > cursor:
+                holes.append((cursor, start, start - cursor))
+            cursor = start + size
+        if cursor < self.total_kb:
+            holes.append((cursor, self.total_kb, self.total_kb - cursor))
+        return holes
+
+    def status(self):
+        print("> memory_status --reserved")
+        print(f"--- MAPA DA ÁREA CRÍTICA/RESERVADA DA RAM (Total: {self.total_kb // 1024} MB - Alocação Fixa) ---")
+        self.segments.sort(key=lambda s: s[0])
+        cursor, hole_idx = 0, 1
+        for start, size, name in self.segments:
+            if start > cursor:
+                h_size = start - cursor
+                print(f"[{cursor/1024:.1f} MB - {start/1024:.1f} MB] : FRAGMENTO LIVRE {hole_idx:<3} ({h_size} KB)  [LIVRE - LACUNA]")
+                hole_idx += 1
+            print(f"[{start/1024:.1f} MB - {(start+size)/1024:.1f} MB] : {name:<19} ({size} KB)  [OCUPADO]")
+            cursor = start + size
+        if cursor < self.total_kb:
+            h_size = self.total_kb - cursor
+            print(f"[{cursor/1024:.1f} MB - {self.total_kb/1024:.1f} MB] : FRAGMENTO LIVRE {hole_idx:<3} ({h_size} KB)  [LIVRE - LACUNA]")
+
+        holes = self.get_free_holes()
+        total_free = sum(h[2] for h in holes)
+        max_contig = max((h[2] for h in holes), default=0)
+        has_ext_frag = len(holes) > 1
+
+        print("\n--- DIAGNÓSTICO DE FRAGMENTAÇÃO EXTERNA ---")
+        print(f"Total de Memória Livre na Área Reservada : {total_free} KB ({total_free/1024:.1f} MB)")
+        print(f"Maior Bloco Contíguo Disponível          : {max_contig} KB ({max_contig/1024:.1f} MB)")
+        print(f"Fragmentação Externa Detectada           : {'SIM (' + str(len(holes)) + ' fragmentos não contíguos)' if has_ext_frag else 'NÃO'}")
+        if has_ext_frag and total_free > max_contig:
+            req_test = max_contig + 512
+            if req_test <= total_free:
+                print(f"Status: Uma requisição contígua de {req_test} KB falhará por ausência de bloco único.\n")
+
+    def compact(self):
+        print("> memory_compact --reserved")
+        print("[EXECUTANDO COMPACTAÇÃO DA ÁREA RESERVADA DA RAM]")
+        print("Realocando blocos contíguos para eliminar a fragmentação externa...")
+        self.segments.sort(key=lambda s: s[0])
+        cursor = 0
+        moved = False
+        for seg in self.segments:
+            old_start, size, name = seg
+            if old_start != cursor:
+                print(f"- Mapeamento de '{name}': [{old_start/1024:.1f} MB a {(old_start+size)/1024:.1f} MB] -> Ajustado para: [{cursor/1024:.1f} MB a {(cursor+size)/1024:.1f} MB]")
+                seg[0] = cursor
+                moved = True
+            cursor += size
+        if not moved:
+            print("- Memória já está contígua.")
+
+        print("\n--- MAPA APÓS COMPACTAÇÃO ---")
+        for start, size, name in self.segments:
+            print(f"[{start/1024:.1f} MB - {(start+size)/1024:.1f} MB] : {name:<19} ({size} KB)  [OCUPADO]")
+        free_end = self.total_kb - cursor
+        if free_end > 0:
+            print(f"[{cursor/1024:.1f} MB - {self.total_kb/1024:.1f} MB] : Bloco Livre Contíguo ({free_end} KB) [LIVRE]")
+        print(f"Resultado: Fragmentação externa eliminada. Maior bloco contíguo: {free_end} KB.\n")
+
+
+class VirtualMemoryManager:
+    """Região Dinâmica Paginada com Tabela de Páginas, Swapping real e algoritmo LRU."""
+    def __init__(self, total_frames=128, page_size=4096):
+        self.total_frames = total_frames
+        self.page_size = page_size
+        # Molduras físicas da RAM: frame_id -> {"pid": int, "proc": str, "page": int, "last_used": int, "data": bytearray}
+        self.frames = {}
+        self.swap_space = {}  # Memória secundária (Swap): (proc_name, page_num) -> bytearray
+        self.page_tables = {} # proc_name -> {"pid": int, "size_bytes": int, "pages": {page_num: frame_id ou None}}
+        self.clock = 100
+        self.next_pid = 101
+
+    def create_process(self, name, size_kb):
+        size_bytes = size_kb * 1024
+        num_pages = math.ceil(size_bytes / self.page_size)
+        pid = self.next_pid
+        self.next_pid += 1
+
+        self.page_tables[name] = {
+            "pid": pid,
+            "size_bytes": size_bytes,
+            "pages": {p: None for p in range(num_pages)}
+        }
+
+        print(f"> create_process --name \"{name}\" --size {size_kb}KB --type normal")
+        print("[CRIAÇÃO DE PROCESSO NÃO CRÍTICO - MEMÓRIA VIRTUAL]")
+        print(f"Tamanho do Processo : {size_kb} KB ({size_bytes} Bytes)")
+        print(f"Tamanho da Página   : {self.page_size // 1024} KB ({self.page_size} Bytes)")
+        print(f"Cálculo de Páginas  : {size_bytes / self.page_size:.1f} -> Requer {num_pages} Páginas Lógicas (Páginas {', '.join(map(str, range(num_pages)))}).\n")
+
+        print("--- ANÁLISE DE FRAGMENTAÇÃO INTERNA ---")
+        rem = size_bytes
+        total_frag = 0
+        for p in range(num_pages):
+            used = min(rem, self.page_size)
+            perc = (used / self.page_size) * 100
+            extra = f" ({perc:.0f}% de uso)" if used < self.page_size else f" ({perc:.0f}%)"
+            print(f"Página Lógica {p} : {used} Bytes ocupados{extra}")
+            if used < self.page_size:
+                total_frag += (self.page_size - used)
+            rem -= used
+
+        print(f"Fragmentação Interna Total: {total_frag} Bytes de desperdício na Página Lógica {num_pages - 1}.")
+        print("Status: Tabela de Páginas gerada sem alocar molduras na RAM (Alocação por demanda).\n")
+
+    def map_page_direct(self, proc_name, page_num, frame_id, age_ms=10):
+        """Carrega uma página específica em uma moldura física (para estado inicial de execução)."""
+        pt = self.page_tables[proc_name]
+        pt["pages"][page_num] = frame_id
+        self.frames[frame_id] = {
+            "pid": pt["pid"],
+            "proc": proc_name,
+            "page": page_num,
+            "last_used": self.clock - age_ms,
+            "data": bytearray(f"DATA_{proc_name}_P{page_num}".encode())
+        }
+
+    def fill_remaining_frames_for_pressure(self, holder_proc="Bg_Service", holder_pid=102):
+        """Preenche as molduras livres restantes para demonstrar pressão de memória e disparo do LRU."""
+        p_idx = 0
+        for f_id in range(self.total_frames):
+            if f_id not in self.frames:
+                # Moldura 88 recebe a página mais antiga (45ms sem uso) para ser escolhida pelo LRU real
+                age = 45 if f_id == 88 else 15
+                self.frames[f_id] = {
+                    "pid": holder_pid,
+                    "proc": holder_proc,
+                    "page": p_idx,
+                    "last_used": self.clock - age,
+                    "data": bytearray(f"SWAP_PAYLOAD_PID{holder_pid}_P{p_idx}".encode())
+                }
+                p_idx += 1
+
+    def translate_address(self, proc_name, page_num):
+        print(f"> translate_address --process {proc_name} --page {page_num}")
+        print("[TRADUÇÃO DE ENDEREÇO: PÁGINA LÓGICA -> MOLDURA FÍSICA]")
+        pt = self.page_tables.get(proc_name)
+        frame_id = pt["pages"].get(page_num) if pt else None
+        if frame_id is not None:
+            self.clock += 1
+            self.frames[frame_id]["last_used"] = self.clock
+            print(f"Solicitação: Página Lógica {page_num} -> Mapeada na Moldura Física {frame_id} (RAM Dinâmica) [HIT]\n")
+        else:
+            print(f"Solicitação: Página Lógica {page_num} -> Não mapeada na RAM [PAGE FAULT]\n")
+
+    def access_page(self, proc_name, page_num, instruction):
+        print(f'> execute_step --process {proc_name} --instruction "{instruction}"')
+        print("[CPU - REFERÊNCIA DE MEMÓRIA EM EXECUÇÃO]")
+        print(f"{proc_name} requisita acesso à Página Lógica {page_num}...")
+        pt = self.page_tables[proc_name]
+        frame_id = pt["pages"][page_num]
+
+        if frame_id is not None:
+            self.clock += 1
+            self.frames[frame_id]["last_used"] = self.clock
+            print(f"- Consulta Tabela de Páginas -> HIT na Moldura Física {frame_id}.\n")
+            return
+
+        print(f"- Consulta Tabela de Páginas -> Página Lógica {page_num} NÃO ESTÁ NA RAM!\n")
+        print(f"[PAGE FAULT DETECTADO]: Página Lógica {page_num} ausente na RAM!")
+
+        # Verifica se há moldura livre; se cheia, executa LRU real
+        free_frames = [f for f in range(self.total_frames) if f not in self.frames]
+        if free_frames:
+            chosen_frame = free_frames[0]
+        else:
+            print("Memória RAM cheia. Executando Substituição de Página (Algoritmo LRU):")
+            # Seleção real da moldura com menor timestamp 'last_used'
+            victim_frame = min(self.frames.keys(), key=lambda f: self.frames[f]["last_used"])
+            victim = self.frames[victim_frame]
+            idle_ms = self.clock - victim["last_used"]
+
+            print(f"- Analisando histórico de acesso: Página Lógica {victim['page']} do PID {victim['pid']} não é usada há {idle_ms}ms (Mais antiga).")
+            # Salva os bytes reais da vítima na área de Swap (Disco)
+            self.swap_space[(victim["proc"], victim["page"])] = victim["data"]
+            if victim["proc"] in self.page_tables:
+                self.page_tables[victim["proc"]]["pages"][victim["page"]] = None
+            print(f"- Removendo Página Lógica {victim['page']} do PID {victim['pid']} da RAM -> Salvando no Swap (Disco).")
+            chosen_frame = victim_frame
+
+        # Carrega a página solicitada (do Swap se existir, ou nova) na moldura escolhida
+        restored_data = self.swap_space.pop((proc_name, page_num), bytearray(f"DATA_{proc_name}_P{page_num}".encode()))
+        self.clock += 1
+        self.frames[chosen_frame] = {
+            "pid": pt["pid"],
+            "proc": proc_name,
+            "page": page_num,
+            "last_used": self.clock,
+            "data": restored_data
+        }
+        pt["pages"][page_num] = chosen_frame
+        print(f"- Carregando Página Lógica {page_num} do {proc_name} na Moldura Física {chosen_frame} (RAM Dinâmica).")
+        print(f"- Tabela de Páginas atualizada: Página Lógica {page_num} ---> Moldura Física {chosen_frame}.\n")
+
+    def memory_summary(self):
+        used_frames = len(self.frames)
+        print("--- RESUMO DE OCUPAÇÃO DE MEMÓRIA ---")
+        print(f"RAM Dinâmica (Paginada): {used_frames}/{self.total_frames} molduras ocupadas ({used_frames * 4} KB / {self.total_frames * 4} KB) | Páginas em Swap: {len(self.swap_space)}\n")
+
+
 class FileSystem:
     def __init__(self, block_size=4096, total_blocks=16):
         self.block_size = block_size
@@ -49,6 +287,10 @@ class FileSystem:
         self.raid_disks = [bytearray(block_size) for _ in range(3)]
         self.io_queue = []
         self.head_pos = 53
+
+        # Etapa 4: Subsistema de Memória Híbrida (Reservada Contígua + Virtual Paginada)
+        self.reserved_mem = ReservedMemory(total_kb=4096)
+        self.virtual_mem = VirtualMemoryManager(total_frames=128, page_size=block_size)
 
         # Inicializa Raiz '/' no Bloco 0
         self.root = FileNode("/", is_dir=True)
@@ -135,13 +377,10 @@ class FileSystem:
         if not node or not self._check_acl(node, path, 'w'):
             return
         key_bytes = hashlib.sha256(key.encode()).digest()
-        
-        # Criptografa de verdade os bytes de cada bloco físico do arquivo via XOR
         for b_idx in self.disk[node.inode_block].pointers:
             raw = self.disk[b_idx].read()
             cipher = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(raw))
             self.disk[b_idx].write(cipher)
-            
         node.encrypted = True
         sample = "0x" + self.disk[self.disk[node.inode_block].pointers[0]].read()[:4].hex().upper()
         print(f"Arquivo '{path}' criptografado com sucesso.")
@@ -158,7 +397,6 @@ class FileSystem:
 
         for f in files:
             p = self._abs_path(f)
-            # Recalcula o hash SHA-256 real dos bytes de cada bloco e compara com o oficial
             corrupted = any(self.disk[b].calc_hash() != self.disk[b].saved_hash for b in self.disk[f.inode_block].pointers)
             if corrupted:
                 print(f"\n- {p:<26}: [ALERTA] Hash do bloco difere do registro oficial!")
@@ -193,7 +431,6 @@ class FileSystem:
         fnode.size = size_bytes
         abs_p = (self._abs_path(parent) + "/" + name).replace("//", "/")
 
-        # Aloca bloco de i-node e grava a tabela de ponteiros real
         inode_idx = free.pop(0)
         data_idxs = free[:blocks_needed]
         self.disk[inode_idx].status = f"INODE_{name.split('.')[0].upper()}"
@@ -202,7 +439,6 @@ class FileSystem:
         self.disk[inode_idx].write(str(data_idxs).encode())
         fnode.inode_block = inode_idx
 
-        # Grava os bytes reais nos blocos de dados apontados pelo i-node
         payload = (f"DADOS_DO_ARQUIVO_{name}_".encode() * 512)[:size_bytes]
         rem = size_bytes
         for i, b_idx in enumerate(data_idxs):
@@ -310,7 +546,6 @@ class FileSystem:
         print(f"> write_file {path} --size {size_kb}")
         print("Arranjo Ativo: RAID 5 (3 Discos Físicos, Blocos de 4 KB)\n")
         
-        # Cria dois blocos reais de 4 KB e calcula a paridade matemática via XOR byte a byte
         part1 = (b"PLANILHA_PARTE_1_" * 256)[:self.block_size]
         part2 = (b"PLANILHA_PARTE_2_" * 256)[:self.block_size]
         parity = bytes(b1 ^ b2 for b1, b2 in zip(part1, part2))
@@ -327,14 +562,37 @@ class FileSystem:
 
         print("[TESTE DE FALHA SIMULADO]")
         print("- Falha forçada no Disco 2!\n")
-        # Zera fisicamente os bytes do Disco 2 para simular a perda real
         self.raid_disks[1] = bytearray(self.block_size)
 
-        # Reconstrói os bytes do Disco 2 fazendo (Disco 1 XOR Disco 3) byte a byte
         recovered = bytes(b1 ^ bp for b1, bp in zip(self.raid_disks[0], self.raid_disks[2]))
         self.raid_disks[1][:] = recovered
         status = "OK" if recovered == part2 else "ERRO"
         print(f"- Recuperando Bloco 02 via operação XOR: (Disco 1 XOR Disco 3) -> Reconstrução [{status}]\n")
+
+    # --- ETAPA 4: PROCESSOS E GERENCIAMENTO DE MEMÓRIA HÍBRIDA ---
+    def create_process(self, name, size_kb, proc_type="normal"):
+        size_val = int(str(size_kb).upper().replace("KB", ""))
+        if proc_type == "critical":
+            if self.mode != "MODO_KERNEL":
+                print(f"[NEGADO] Processos críticos exigem MODO_KERNEL.\n")
+                return
+            print(f'> create_process --name "{name}" --size {size_val}KB --type critical')
+            res = self.reserved_mem.allocate(name, size_val)
+            if res:
+                s_kb, e_kb = res
+                print(f"- Alocado de forma contígua na Área Reservada: [{s_kb/1024:.1f} MB até {e_kb/1024:.1f} MB] ({size_val} KB)\n")
+            else:
+                print(f"[ERRO] Espaço contíguo insuficiente na Área Reservada para {size_val} KB.\n")
+        else:
+            self.virtual_mem.create_process(name, size_val)
+
+    def terminate_process(self, name):
+        print(f'> terminate_process --name "{name}"')
+        res = self.reserved_mem.free(name)
+        if res:
+            s_kb, e_kb, size_val = res
+            print(f"[ENCERRAMENTO DE PROCESSO CRÍTICO] Processo '{name}' finalizado.")
+            print(f"Área de {size_val} KB no intervalo [{s_kb/1024:.1f} MB a {e_kb/1024:.1f} MB] liberada na Área Reservada da RAM.\n")
 
 
 if __name__ == "__main__":
@@ -362,27 +620,30 @@ if __name__ == "__main__":
     fs.create("/home/carlos/segredo.txt", "2KB", silent=True)
     fs.set_acl("/home/carlos/segredo.txt", "carlos", "devs", "700")
 
-    # Login como Carlos e teste de bloqueio de ACL
     fs.login("carlos", "senha123")
     fs.read_file("/sistema/config.sys")
-
-    # Criptografia XOR real nos blocos de segredo.txt
     fs.encrypt_file("/home/carlos/segredo.txt", "MinhaChave123")
 
-    # Adulteração direta na memória física do primeiro bloco de app.log para o Antivírus detectar
     bloco_alvo = fs.disk[fs.root.children["sistema"].children["logs"].children["app.log"].inode_block].pointers[0]
     fs.disk[bloco_alvo].data[:15] = b"DADO_CORROMPIDO"
-
     fs.antivirus_scan()
-    print("=== TERMINAL INTERATIVO (Digite comandos ou 'sair' para encerrar) ===")
-    while True:
-        cmd = input(f"{fs.user}@so-ufrpe$ ").strip().split()
-        if not cmd or cmd[0] == "sair": break
-        elif cmd[0] == "mkdir" and len(cmd) > 1: fs.mkdir(cmd[1])
-        elif cmd[0] == "create" and len(cmd) > 2: fs.create(cmd[1], cmd[2])
-        elif cmd[0] == "read_file" and len(cmd) > 1: fs.read_file(cmd[1])
-        elif cmd[0] == "rm" and len(cmd) > 1: fs.rm(cmd[1])
-        elif cmd[0] == "tree": fs.print_tree()
-        elif cmd[0] == "fs_status": fs.fs_status()
-        elif cmd[0] == "antivirus_scan": fs.antivirus_scan()
-        else: print("Comandos: mkdir <path>, create <path> <N>KB, read_file <path>, rm <path>, tree, fs_status, antivirus_scan, sair")
+
+    # --- ETAPA 4: GERENCIAMENTO DE MEMÓRIA HÍBRIDA ---
+    fs.login("root", "admin123")
+
+    # Exemplo 4.1: Área Reservada (Alocação Contígua, Fragmentação Externa e Compactação)
+    fs.create_process("Kernel_DiskDriver", "512KB", proc_type="critical")
+    fs.create_process("Kernel_NetDriver", "1024KB", proc_type="critical")
+    fs.create_process("Kernel_CryptoEngine", "512KB", proc_type="critical")
+    fs.terminate_process("Kernel_NetDriver")
+    fs.reserved_mem.status()
+    fs.reserved_mem.compact()
+
+    # Exemplo 4.2: Área de Memória Virtual (Paginação, Fragmentação Interna e LRU)
+    fs.create_process("App_Navegador", "10KB", proc_type="normal")
+    fs.virtual_mem.map_page_direct("App_Navegador", page_num=1, frame_id=12, age_ms=5)
+    fs.virtual_mem.fill_remaining_frames_for_pressure(holder_proc="Bg_Service", holder_pid=102)
+
+    fs.virtual_mem.translate_address("App_Navegador", page_num=1)
+    fs.virtual_mem.access_page("App_Navegador", page_num=2, instruction="LOAD_DATA Página 2")
+    fs.virtual_mem.memory_summary()
